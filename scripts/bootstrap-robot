@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# Bootstrap a fresh Jetson for Soraccel runtime deployment.
+set -Eeuo pipefail
+
+readonly DEFAULT_DEPLOYMENT_URL="https://github.com/Soraccel/soraccel_deployment.git"
+readonly DEFAULT_SETUP_URL="https://github.com/Soraccel/soraccel_setup.git"
+readonly DEPLOYMENT_DIR="/opt/soraccel/deployment"
+readonly SETUP_DIR="/opt/soraccel/setup"
+readonly GHCR_TOKEN_FILE="/etc/soraccel/ghcr.token"
+
+robot_id=""
+deployment_ref=""
+deployment_url="$DEFAULT_DEPLOYMENT_URL"
+setup_ref=""
+setup_url="$DEFAULT_SETUP_URL"
+ghcr_username="soraccel-robot"
+service_user="sora"
+
+usage() {
+  cat <<'EOF'
+Usage: bootstrap-robot --robot-id <id> --setup-ref <tag-or-commit> --deployment-ref <tag-or-commit> [options]
+
+Options:
+  --deployment-url <url>  Deployment repository URL.
+  --setup-url <url>       Setup repository URL.
+  --setup-ref <ref>       Approved setup tag or commit.
+  --ghcr-username <name> GitHub account owning the read:packages token.
+  --service-user <name>  Existing local account that runs containers (default: sora).
+  -h, --help              Show this help.
+
+Run this script as root. It asks for the GHCR token on /dev/tty, so it is safe
+to invoke through `curl | sudo bash` without placing the token in shell history.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --robot-id) robot_id="${2:?missing robot id}"; shift 2 ;;
+    --deployment-ref) deployment_ref="${2:?missing deployment ref}"; shift 2 ;;
+    --deployment-url) deployment_url="${2:?missing deployment URL}"; shift 2 ;;
+    --setup-ref) setup_ref="${2:?missing setup ref}"; shift 2 ;;
+    --setup-url) setup_url="${2:?missing setup URL}"; shift 2 ;;
+    --ghcr-username) ghcr_username="${2:?missing GHCR username}"; shift 2 ;;
+    --service-user) service_user="${2:?missing service user}"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown option: $1" >&2; usage >&2; exit 64 ;;
+  esac
+done
+
+[[ $EUID -eq 0 ]] || { echo "Run with sudo." >&2; exit 77; }
+[[ "$robot_id" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || {
+  echo "--robot-id must use lowercase letters, digits and hyphens." >&2
+  exit 64
+}
+[[ "$service_user" =~ ^[a-z_][a-z0-9_-]*$ ]] || {
+  echo "--service-user is not a valid Linux username." >&2
+  exit 64
+}
+[[ -n "$deployment_ref" ]] || {
+  echo "--deployment-ref is required; use an approved tag or commit." >&2
+  exit 64
+}
+[[ -n "$setup_ref" ]] || {
+  echo "--setup-ref is required; use an approved tag or commit." >&2
+  exit 64
+}
+
+. /etc/os-release
+[[ "${ID:-}" == "ubuntu" && "${VERSION_ID:-}" == "24.04" ]] || {
+  echo "This bootstrap expects JetPack 7 / Ubuntu 24.04." >&2
+  exit 65
+}
+[[ "$(dpkg --print-architecture)" == "arm64" ]] || {
+  echo "This bootstrap must run on an ARM64 Jetson." >&2
+  exit 65
+}
+
+echo "==> Installing Docker Engine and Compose"
+apt-get update
+apt-get install --yes ca-certificates curl git python3 python3-yaml
+install -d -m 0755 /etc/apt/keyrings
+curl --fail --silent --show-error --location \
+  https://download.docker.com/linux/ubuntu/gpg \
+  --output /etc/apt/keyrings/docker.asc
+chmod a+r /etc/apt/keyrings/docker.asc
+printf 'Types: deb\nURIs: https://download.docker.com/linux/ubuntu\nSuites: %s\nComponents: stable\nArchitectures: arm64\nSigned-By: /etc/apt/keyrings/docker.asc\n' \
+  "${UBUNTU_CODENAME:-$VERSION_CODENAME}" \
+  > /etc/apt/sources.list.d/docker.sources
+apt-get update
+apt-get install --yes docker-ce docker-ce-cli containerd.io \
+  docker-buildx-plugin docker-compose-plugin
+systemctl daemon-reload
+systemctl enable --now docker.socket
+systemctl reset-failed docker.service docker.socket || true
+systemctl start docker.service
+
+echo "==> Configuring service account and robot directories"
+id "$service_user" >/dev/null 2>&1 || {
+  echo "Expected the pre-provisioned '$service_user' account." >&2
+  exit 65
+}
+service_group="$(id -gn "$service_user")"
+usermod -aG docker "$service_user"
+install -d -o "$service_user" -g "$service_group" -m 0755 /opt/soraccel
+install -d -o "$service_user" -g "$service_group" -m 0755 /var/log/soraccel
+install -d -o root -g "$service_group" -m 0750 /etc/soraccel
+install -d -o root -g "$service_group" -m 0750 /etc/soraccel/config
+printf 'ROBOT_ID=%s\nSERVICE_USER=%s\nSETUP_DIR=%s\nDEPLOYMENT_DIR=%s\n' \
+  "$robot_id" "$service_user" "$SETUP_DIR" "$DEPLOYMENT_DIR" > /etc/soraccel/robot.env
+chown root:"$service_group" /etc/soraccel/robot.env
+chmod 0640 /etc/soraccel/robot.env
+
+echo "==> Verifying NVIDIA container runtime"
+docker info --format '{{json .Runtimes}}' | grep -q '"nvidia"' || {
+  echo "NVIDIA Docker runtime is unavailable. Finish the JetPack runtime setup first." >&2
+  exit 65
+}
+
+echo "==> Storing GHCR pull credential"
+read -r -s -p "GHCR token for ${ghcr_username}: " ghcr_token </dev/tty
+printf '\n' >&2
+[[ -n "$ghcr_token" ]] || { echo "An empty GHCR token is not valid." >&2; exit 64; }
+umask 027
+printf '%s\n' "$ghcr_token" > "$GHCR_TOKEN_FILE"
+unset ghcr_token
+chown root:"$service_group" "$GHCR_TOKEN_FILE"
+chmod 0640 "$GHCR_TOKEN_FILE"
+runuser -u "$service_user" -- sh -c \
+  "docker login ghcr.io --username '$ghcr_username' --password-stdin < '$GHCR_TOKEN_FILE'"
+
+install_revision() {
+  local directory="$1" url="$2" ref="$3"
+  if [[ -e "$directory" && ! -d "$directory/.git" ]]; then
+    echo "$directory exists but is not a Git checkout." >&2
+    exit 73
+  fi
+  if [[ ! -d "$directory/.git" ]]; then
+    runuser -u "$service_user" -- git clone --no-checkout "$url" "$directory"
+  fi
+  runuser -u "$service_user" -- git -C "$directory" fetch --depth 1 origin "$ref"
+  runuser -u "$service_user" -- git -C "$directory" checkout --detach FETCH_HEAD
+}
+
+echo "==> Installing approved setup and deployment revisions"
+install_revision "$SETUP_DIR" "$setup_url" "$setup_ref"
+install_revision "$DEPLOYMENT_DIR" "$deployment_url" "$deployment_ref"
+
+# User units provide the operational interface: one unit per Compose service.
+# Linger keeps them available at boot even before the operator logs in.
+loginctl enable-linger "$service_user"
+user_systemd_dir="$(getent passwd "$service_user" | cut -d: -f6)/.config/systemd/user"
+install -d -o "$service_user" -g "$service_group" -m 0755 "$user_systemd_dir"
+install -o "$service_user" -g "$service_group" -m 0644 \
+  "$SETUP_DIR/systemd/soraccel-reconcile.service" \
+  "$user_systemd_dir/soraccel-reconcile.service"
+install -d -o "$service_user" -g "$service_group" -m 0755 "$user_systemd_dir/default.target.wants"
+ln -sfn ../soraccel-reconcile.service "$user_systemd_dir/default.target.wants/soraccel-reconcile.service"
+
+echo
+echo "Bootstrap complete."
+echo "Next: review $DEPLOYMENT_DIR/robots/$robot_id/deployment.yaml and add"
+echo "/etc/soraccel/config/mapping_3d.yaml, then run apply as"
+echo "$service_user: $SETUP_DIR/scripts/apply"

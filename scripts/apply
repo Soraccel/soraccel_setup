@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+setup_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+robot_id=""
+pull_images=true
+
+usage() {
+  echo "Usage: $0 [--robot-id <id>] [--no-pull]" >&2
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --robot-id) robot_id="${2:?missing robot id}"; shift 2 ;;
+    --no-pull) pull_images=false; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage; exit 64 ;;
+  esac
+done
+
+if [[ $EUID -eq 0 ]]; then
+  echo "Run apply as the robot service account, not as root." >&2
+  exit 77
+fi
+
+if [[ -r /etc/soraccel/robot.env ]]; then
+  # shellcheck disable=SC1091
+  source /etc/soraccel/robot.env
+  [[ -n "$robot_id" ]] || robot_id="${ROBOT_ID:-}"
+fi
+[[ "$robot_id" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || {
+  echo "A valid --robot-id is required (or set ROBOT_ID in /etc/soraccel/robot.env)." >&2
+  exit 64
+}
+
+deployment_dir="${DEPLOYMENT_DIR:-/opt/soraccel/deployment}"
+manifest="$deployment_dir/robots/$robot_id/deployment.yaml"
+state_dir="${XDG_DATA_HOME:-$HOME/.local/share}/soraccel/$robot_id"
+runtime_env="${XDG_CONFIG_HOME:-$HOME/.config}/soraccel/$robot_id/runtime.env"
+compose_file="$state_dir/compose.yml"
+metadata_dir="$(mktemp -d)"
+trap 'rm -rf "$metadata_dir"' EXIT
+
+[[ -f "$manifest" ]] || { echo "Missing deployment manifest: $manifest" >&2; exit 66; }
+
+while IFS=$'\t' read -r component image; do
+  [[ -n "$component" && -n "$image" ]] || continue
+  if [[ "$pull_images" == true ]]; then
+    docker pull "$image"
+  fi
+  container_id="$(docker create "$image")"
+  if ! docker cp "$container_id:/opt/soraccel/repository.yaml" "$metadata_dir/$component.yaml"; then
+    docker rm "$container_id" >/dev/null
+    echo "Image $image does not contain /opt/soraccel/repository.yaml." >&2
+    echo "Publish a component image built with the current component template." >&2
+    exit 65
+  fi
+  docker rm "$container_id" >/dev/null
+done < <(python3 "$setup_dir/scripts/render-deployment.py" --manifest "$manifest" --list-images)
+
+python3 "$setup_dir/scripts/render-deployment.py" \
+  --manifest "$manifest" \
+  --metadata-dir "$metadata_dir" \
+  --compose-output "$compose_file" \
+  --env-output "$runtime_env"
+
+docker compose -f "$compose_file" config --quiet
+[[ -d /etc/soraccel/config ]] || { echo "Missing /etc/soraccel/config." >&2; exit 66; }
+
+unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+mkdir -p "$unit_dir"
+mapfile -t services < <(docker compose -f "$compose_file" config --services)
+
+for service in "${services[@]}"; do
+  [[ "$service" =~ ^[a-zA-Z0-9_.@-]+$ ]] || {
+    echo "Unsupported Compose service name for systemd: $service" >&2
+    exit 65
+  }
+  unit_path="$unit_dir/soraccel-node-${service}.service"
+  cat > "$unit_path" <<EOF
+# Managed by Soraccel apply. Do not edit: change the Compose service instead.
+[Unit]
+Description=Soraccel robot component: ${service}
+Wants=network-online.target
+After=network-online.target docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=${setup_dir}
+EnvironmentFile=${runtime_env}
+ExecStart=${setup_dir}/scripts/run-service ${compose_file} ${service} up
+ExecStop=${setup_dir}/scripts/run-service ${compose_file} ${service} stop
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=45
+
+[Install]
+WantedBy=default.target
+EOF
+done
+
+# Remove only old generated units which no longer correspond to this Compose
+# manifest. They are stopped first so a removed component cannot keep running.
+for unit_path in "$unit_dir"/soraccel-node-*.service; do
+  [[ -e "$unit_path" ]] || continue
+  grep -qx '# Managed by Soraccel apply. Do not edit: change the Compose service instead.' "$unit_path" || continue
+  unit_name="$(basename "$unit_path")"
+  service_name="${unit_name#soraccel-node-}"
+  service_name="${service_name%.service}"
+  if [[ ! " ${services[*]} " =~ " ${service_name} " ]]; then
+    systemctl --user disable --now "$unit_name" >/dev/null 2>&1 || true
+    rm "$unit_path"
+  fi
+done
+
+systemctl --user daemon-reload
+for service in "${services[@]}"; do
+  unit_name="soraccel-node-${service}.service"
+  enabled="$(docker compose -f "$compose_file" config --format json | \
+    python3 -c 'import json, sys; print(json.load(sys.stdin)["services"][sys.argv[1]].get("labels", {}).get("com.soraccel.enabled-at-boot", "false"))' "$service")"
+  if [[ "$enabled" == true ]]; then
+    systemctl --user enable "$unit_name" >/dev/null
+  else
+    systemctl --user disable "$unit_name" >/dev/null 2>&1 || true
+  fi
+done
+printf 'Installed user units:\n'
+printf '  soraccel-node-%s.service\n' "${services[@]}"
+echo "Use your robot interface or: systemctl --user start soraccel-node-<service>"

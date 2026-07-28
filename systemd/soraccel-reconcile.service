@@ -1,0 +1,10 @@
+[Unit]
+Description=Render the installed Soraccel robot deployment without network pulls
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/soraccel/setup/scripts/apply --no-pull
+
+[Install]
+WantedBy=default.target

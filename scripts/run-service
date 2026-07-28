@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+if [[ $# -ne 3 ]]; then
+  echo "Usage: $0 <rendered-compose-file> <compose-service> <up|stop>" >&2
+  exit 64
+fi
+
+compose_file="$1"
+service="$2"
+action="$3"
+
+[[ -f "$compose_file" ]] || { echo "Missing Compose file: $compose_file" >&2; exit 66; }
+compose_file="$(cd "$(dirname "$compose_file")" && pwd)/$(basename "$compose_file")"
+
+mapfile -t services < <(docker compose -f "$compose_file" config --services)
+if [[ ! " ${services[*]} " =~ " ${service} " ]]; then
+  echo "Unknown Compose service: $service" >&2
+  exit 65
+fi
+
+case "$action" in
+  up)
+    # Deliberately attached: stdout/stderr become journalctl output for this
+    # one robot component.  Its user systemd unit controls its lifecycle.
+    exec docker compose -f "$compose_file" up --no-deps --no-build "$service"
+    ;;
+  stop)
+    exec docker compose -f "$compose_file" stop "$service"
+    ;;
+  *)
+    echo "Action must be 'up' or 'stop'." >&2
+    exit 64
+    ;;
+esac
