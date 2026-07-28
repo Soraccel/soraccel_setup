@@ -51,8 +51,8 @@ At boot, the user service `soraccel-reconcile.service` runs `apply --no-pull`.
 It reads the installed deployment revision but does not contact Git or GHCR.
 Non-secret files from `robots/<robot-id>/config/` are mirrored into
 `/etc/soraccel/config/`; do not edit that target manually.
-The host service account also receives `SORACCEL_ROBOT_ID` in interactive Bash
-shells and user-systemd's environment.
+`apply` also reconciles `SORACCEL_ROBOT_ID` into interactive Bash shells and
+the host user-systemd environment.
 
 For an intentional rollout:
 
