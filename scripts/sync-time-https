@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Bootstrap-only time recovery for robots without NTP or a valid RTC.
+set -Eeuo pipefail
+
+readonly URL="${SORACCEL_TIME_URL:-https://google.com}"
+
+# TLS verification is deliberately disabled only here: an invalid local clock
+# makes certificate verification impossible. The recovered Date header lets
+# normal TLS validation work again for every subsequent network operation.
+http_date="$(curl --insecure --fail --silent --show-error --head \
+  --connect-timeout 10 --max-time 20 "$URL" | \
+  awk -F': ' 'tolower($1) == "date" {print $2; exit}' | tr -d '\r')"
+
+[[ -n "$http_date" ]] || { echo "Could not obtain an HTTP Date header." >&2; exit 1; }
+date --utc --set "$http_date"
+hwclock --systohc || echo "No writable RTC; system clock was still updated." >&2

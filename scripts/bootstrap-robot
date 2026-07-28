@@ -13,6 +13,7 @@ deployment_ref=""
 deployment_url="$DEFAULT_DEPLOYMENT_URL"
 setup_ref=""
 setup_url="$DEFAULT_SETUP_URL"
+date_time=""
 ghcr_username="soraccel-robot"
 service_user="sora"
 
@@ -24,6 +25,7 @@ Options:
   --deployment-url <url>  Deployment repository URL.
   --setup-url <url>       Setup repository URL.
   --setup-ref <ref>       Approved setup tag or commit.
+  --date-time <UTC time>  Set the initial UTC time (ISO 8601 or date(1) input).
   --ghcr-username <name> GitHub account owning the read:packages token.
   --service-user <name>  Existing local account that runs containers (default: sora).
   -h, --help              Show this help.
@@ -40,6 +42,7 @@ while [[ $# -gt 0 ]]; do
     --deployment-url) deployment_url="${2:?missing deployment URL}"; shift 2 ;;
     --setup-ref) setup_ref="${2:?missing setup ref}"; shift 2 ;;
     --setup-url) setup_url="${2:?missing setup URL}"; shift 2 ;;
+    --date-time) date_time="${2:?missing date time}"; shift 2 ;;
     --ghcr-username) ghcr_username="${2:?missing GHCR username}"; shift 2 ;;
     --service-user) service_user="${2:?missing service user}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -64,6 +67,14 @@ done
   echo "--setup-ref is required; use an approved tag or commit." >&2
   exit 64
 }
+
+if [[ -n "$date_time" ]]; then
+  date --utc --set "$date_time" >/dev/null || {
+    echo "--date-time is not accepted by date(1): $date_time" >&2
+    exit 64
+  }
+  hwclock --systohc || true
+fi
 
 . /etc/os-release
 [[ "${ID:-}" == "ubuntu" && "${VERSION_ID:-}" == "24.04" ]] || {
@@ -153,6 +164,10 @@ install -d -o "$service_user" -g "$service_group" -m 0755 "$user_systemd_dir"
 install -o "$service_user" -g "$service_group" -m 0644 \
   "$SETUP_DIR/systemd/soraccel-reconcile.service" \
   "$user_systemd_dir/soraccel-reconcile.service"
+install -m 0644 "$SETUP_DIR/systemd/soraccel-sync-time.service" \
+  /etc/systemd/system/soraccel-sync-time.service
+systemctl daemon-reload
+systemctl enable soraccel-sync-time.service
 install -d -o "$service_user" -g "$service_group" -m 0755 "$user_systemd_dir/default.target.wants"
 ln -sfn ../soraccel-reconcile.service "$user_systemd_dir/default.target.wants/soraccel-reconcile.service"
 

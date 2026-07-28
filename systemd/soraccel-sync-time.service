@@ -1,0 +1,12 @@
+[Unit]
+Description=Recover the Soraccel robot clock from an HTTPS Date header
+Wants=network-online.target
+After=network-online.target
+Before=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/soraccel/setup/scripts/sync-time-https
+
+[Install]
+WantedBy=multi-user.target

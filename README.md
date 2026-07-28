@@ -28,6 +28,17 @@ curl -fsSL https://raw.githubusercontent.com/Soraccel/soraccel_setup/main/script
 The script asks for the limited `soraccel-robot` GHCR token on the terminal and
 stores it outside Git. It never builds ROS source on the robot.
 
+For a robot without NTP or a valid RTC, pass a known UTC time when executing a
+locally provisioned copy of the bootstrap script:
+
+```bash
+sudo ./bootstrap-robot ... --date-time '2026-07-28 14:00:00 UTC'
+```
+
+It also installs `soraccel-sync-time.service`, adapted from the Munwag HTTPS
+Date recovery service. At boot, it recovers the date from an HTTPS `Date`
+header before the normal robot stack is used.
+
 ## Robot layout
 
 ```text
