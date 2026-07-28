@@ -44,11 +44,13 @@ header before the normal robot stack is used.
 ```text
 /opt/soraccel/setup/        # pinned operational scripts
 /opt/soraccel/deployment/   # pinned desired-state manifest
-/etc/soraccel/config/       # local configuration, outside Git
+/etc/soraccel/config/       # mirror of the selected deployment revision
 ```
 
 At boot, the user service `soraccel-reconcile.service` runs `apply --no-pull`.
 It reads the installed deployment revision but does not contact Git or GHCR.
+Non-secret files from `robots/<robot-id>/config/` are mirrored into
+`/etc/soraccel/config/`; do not edit that target manually.
 
 For an intentional rollout:
 

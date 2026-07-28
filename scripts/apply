@@ -35,6 +35,8 @@ fi
 
 deployment_dir="${DEPLOYMENT_DIR:-/opt/soraccel/deployment}"
 manifest="$deployment_dir/robots/$robot_id/deployment.yaml"
+config_source="$deployment_dir/robots/$robot_id/config"
+config_target="/etc/soraccel/config"
 state_dir="${XDG_DATA_HOME:-$HOME/.local/share}/soraccel/$robot_id"
 runtime_env="${XDG_CONFIG_HOME:-$HOME/.config}/soraccel/$robot_id/runtime.env"
 compose_file="$state_dir/compose.yml"
@@ -42,6 +44,34 @@ metadata_dir="$(mktemp -d)"
 trap 'rm -rf "$metadata_dir"' EXIT
 
 [[ -f "$manifest" ]] || { echo "Missing deployment manifest: $manifest" >&2; exit 66; }
+[[ -d "$config_source" ]] || { echo "Missing versioned robot configuration: $config_source" >&2; exit 66; }
+[[ -d "$config_target" && -w "$config_target" ]] || {
+  echo "Cannot synchronize $config_target; rerun the current bootstrap script." >&2
+  exit 77
+}
+
+# The deployment repository is the source of truth for non-secret robot
+# configuration. Keep this directory flat: image metadata refers to files by
+# basename when mounting them into /config.
+invalid_config_entry="$(find "$config_source" -mindepth 1 -maxdepth 1 ! -type f -print -quit)"
+[[ -z "$invalid_config_entry" ]] || {
+  echo "Robot configuration must contain only regular files: $invalid_config_entry" >&2
+  exit 65
+}
+mapfile -t config_files < <(find "$config_source" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort)
+for config_file in "${config_files[@]}"; do
+  [[ "$config_file" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || {
+    echo "Unsupported configuration filename: $config_file" >&2
+    exit 65
+  }
+done
+
+# This target is exclusively managed by apply. Deleting stale files ensures a
+# removed configuration cannot silently affect an updated deployment.
+find "$config_target" -mindepth 1 -delete
+for config_file in "${config_files[@]}"; do
+  install -m 0644 "$config_source/$config_file" "$config_target/$config_file"
+done
 
 while IFS=$'\t' read -r component image; do
   [[ -n "$component" && -n "$image" ]] || continue
