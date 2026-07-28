@@ -119,10 +119,25 @@ install -d -o root -g "$service_group" -m 0750 /etc/soraccel
 # by apply. The service account must therefore be able to replace this exact
 # directory, while credentials remain protected in /etc/soraccel.
 install -d -o root -g "$service_group" -m 0770 /etc/soraccel/config
-printf 'ROBOT_ID=%s\nSERVICE_USER=%s\nSETUP_DIR=%s\nDEPLOYMENT_DIR=%s\n' \
+printf 'ROBOT_ID=%s\nSORACCEL_ROBOT_ID=%s\nSERVICE_USER=%s\nSETUP_DIR=%s\nDEPLOYMENT_DIR=%s\n' \
+  "$robot_id" \
   "$robot_id" "$service_user" "$SETUP_DIR" "$DEPLOYMENT_DIR" > /etc/soraccel/robot.env
 chown root:"$service_group" /etc/soraccel/robot.env
 chmod 0640 /etc/soraccel/robot.env
+
+service_home="$(getent passwd "$service_user" | cut -d: -f6)"
+environment_dir="$service_home/.config/environment.d"
+install -d -o "$service_user" -g "$service_group" -m 0755 "$environment_dir"
+printf 'SORACCEL_ROBOT_ID=%s\n' "$robot_id" > "$environment_dir/90-soraccel.conf"
+chown "$service_user:$service_group" "$environment_dir/90-soraccel.conf"
+chmod 0644 "$environment_dir/90-soraccel.conf"
+
+shell_rc="$service_home/.bashrc"
+touch "$shell_rc"
+if ! grep -Fqx '# Managed by Soraccel robot bootstrap.' "$shell_rc"; then
+  printf '\n# Managed by Soraccel robot bootstrap.\nif [[ -r /etc/soraccel/robot.env ]]; then\n  source /etc/soraccel/robot.env\n  export SORACCEL_ROBOT_ID\nfi\n' >> "$shell_rc"
+fi
+chown "$service_user:$service_group" "$shell_rc"
 
 echo "==> Verifying NVIDIA container runtime"
 docker info --format '{{json .Runtimes}}' | grep -q '"nvidia"' || {
