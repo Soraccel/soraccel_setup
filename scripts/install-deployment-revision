@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly DEPLOYMENT_DIR="/opt/soraccel/deployment"
-readonly SETUP_DIR="/opt/soraccel/setup"
-
 if [[ $# -ne 2 || "$1" != "--deployment-ref" ]]; then
   echo "Usage: $0 --deployment-ref <approved-tag-or-commit>" >&2
   exit 64
@@ -15,12 +12,14 @@ deployment_ref="$2"
 # shellcheck disable=SC1091
 source /etc/soraccel/robot.env
 service_user="${SERVICE_USER:-sora}"
+deployment_dir="${DEPLOYMENT_DIR:-/opt/soraccel/deployment}"
+setup_dir="${SETUP_DIR:-/opt/soraccel/setup}"
 id "$service_user" >/dev/null 2>&1 || { echo "Unknown service user: $service_user" >&2; exit 65; }
-[[ -d "$DEPLOYMENT_DIR/.git" ]] || { echo "Missing deployment checkout: $DEPLOYMENT_DIR" >&2; exit 66; }
+[[ -d "$deployment_dir/.git" ]] || { echo "Missing deployment checkout: $deployment_dir" >&2; exit 66; }
 
 # A ref is fetched explicitly and checked out detached: this never follows a
 # floating branch and does not pull component source repositories.
-runuser -u "$service_user" -- git -C "$DEPLOYMENT_DIR" fetch --depth 1 origin "$deployment_ref"
-runuser -u "$service_user" -- git -C "$DEPLOYMENT_DIR" checkout --detach FETCH_HEAD
-echo "Installed deployment revision $(git -C "$DEPLOYMENT_DIR" rev-parse HEAD)."
-echo "Now run, as $service_user: $SETUP_DIR/scripts/apply"
+runuser -u "$service_user" -- git -C "$deployment_dir" fetch --depth 1 origin "$deployment_ref"
+runuser -u "$service_user" -- git -C "$deployment_dir" checkout --detach FETCH_HEAD
+echo "Installed deployment revision $(git -C "$deployment_dir" rev-parse HEAD)."
+echo "Now run, as $service_user: $setup_dir/scripts/apply"
