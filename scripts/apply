@@ -28,10 +28,25 @@ if [[ -r /etc/soraccel/robot.env ]]; then
   source /etc/soraccel/robot.env
   [[ -n "$robot_id" ]] || robot_id="${ROBOT_ID:-}"
 fi
-[[ "$robot_id" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || {
+[[ "$robot_id" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]] || {
   echo "A valid --robot-id is required (or set ROBOT_ID in /etc/soraccel/robot.env)." >&2
   exit 64
 }
+export SORACCEL_ROBOT_ID="$robot_id"
+
+# Host-facing state is reconciled here, with the same desired robot identity
+# used to select the manifest. This makes both interactive shells and the
+# user systemd manager expose the value without relying on bootstrap side
+# effects.
+environment_dir="${XDG_CONFIG_HOME:-$HOME/.config}/environment.d"
+mkdir -p "$environment_dir"
+printf 'SORACCEL_ROBOT_ID=%s\n' "$SORACCEL_ROBOT_ID" > "$environment_dir/90-soraccel.conf"
+shell_rc="$HOME/.bashrc"
+touch "$shell_rc"
+if ! grep -Fqx '# Managed by Soraccel apply.' "$shell_rc"; then
+  printf '\n# Managed by Soraccel apply.\nexport SORACCEL_ROBOT_ID=%q\n' "$SORACCEL_ROBOT_ID" >> "$shell_rc"
+fi
+systemctl --user import-environment SORACCEL_ROBOT_ID
 
 deployment_dir="${DEPLOYMENT_DIR:-/opt/soraccel/deployment}"
 manifest="$deployment_dir/robots/$robot_id/deployment.yaml"

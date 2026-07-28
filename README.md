@@ -20,7 +20,7 @@ Use immutable refs for both repositories:
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Soraccel/soraccel_setup/main/scripts/bootstrap-robot \
   | sudo bash -s -- \
-      --robot-id test-robot \
+      --robot-id test_robot \
       --setup-ref v0.1.0 \
       --deployment-ref <approved-tag-or-commit>
 ```
@@ -51,6 +51,8 @@ At boot, the user service `soraccel-reconcile.service` runs `apply --no-pull`.
 It reads the installed deployment revision but does not contact Git or GHCR.
 Non-secret files from `robots/<robot-id>/config/` are mirrored into
 `/etc/soraccel/config/`; do not edit that target manually.
+`apply` also reconciles `SORACCEL_ROBOT_ID` into interactive Bash shells and
+the host user-systemd environment.
 
 For an intentional rollout:
 
