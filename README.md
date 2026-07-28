@@ -20,7 +20,7 @@ Use immutable refs for both repositories:
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Soraccel/soraccel_setup/main/scripts/bootstrap-robot \
   | sudo bash -s -- \
-      --robot-id test-robot \
+      --robot-id test_robot \
       --setup-ref v0.1.0 \
       --deployment-ref <approved-tag-or-commit>
 ```
