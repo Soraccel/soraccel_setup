@@ -108,7 +108,9 @@ def main():
             params = launch.get("parameters_file", "")
             if not isinstance(params, str):
                 fail(f"{component}.{launch_name}.parameters_file must be a string")
-            service = f"{component}--{launch_name}"
+            # A systemd unit is generated from this name.  Keep the same
+            # readable single-hyphen convention as development services.
+            service = f"{component}-{launch_name}"
             service_env = {"SORACCEL_LAUNCH_PACKAGE": package, "SORACCEL_LAUNCH_FILE": launch_file}
             if params:
                 service_env["SORACCEL_PARAMETERS_FILE"] = f"/config/{params.lstrip('/').split('/')[-1]}"
