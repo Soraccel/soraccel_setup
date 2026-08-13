@@ -3,13 +3,25 @@
 set -Eeuo pipefail
 
 readonly URL="${SORACCEL_TIME_URL:-https://google.com}"
+readonly ATTEMPTS="${SORACCEL_TIME_ATTEMPTS:-20}"
+readonly RETRY_DELAY_SECONDS="${SORACCEL_TIME_RETRY_DELAY_SECONDS:-15}"
 
 # TLS verification is deliberately disabled only here: an invalid local clock
 # makes certificate verification impossible. The recovered Date header lets
 # normal TLS validation work again for every subsequent network operation.
-http_date="$(curl --insecure --fail --silent --show-error --head \
-  --connect-timeout 10 --max-time 20 "$URL" | \
-  awk -F': ' 'tolower($1) == "date" {print $2; exit}' | tr -d '\r')"
+http_date=""
+for attempt in $(seq 1 "$ATTEMPTS"); do
+  http_date="$(curl --insecure --fail --silent --show-error --head \
+    --connect-timeout 10 --max-time 20 "$URL" | \
+    awk -F': ' 'tolower($1) == "date" {print $2; exit}' | tr -d '\r')" && true
+
+  if [[ -n "$http_date" ]]; then
+    break
+  fi
+
+  echo "Could not obtain an HTTP Date header from $URL (attempt $attempt/$ATTEMPTS)." >&2
+  sleep "$RETRY_DELAY_SECONDS"
+done
 
 [[ -n "$http_date" ]] || { echo "Could not obtain an HTTP Date header." >&2; exit 1; }
 date --utc --set "$http_date"

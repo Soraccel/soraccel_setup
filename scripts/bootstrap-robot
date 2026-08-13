@@ -169,6 +169,7 @@ install -o "$service_user" -g "$service_group" -m 0644 \
   "$user_systemd_dir/soraccel-reconcile.service"
 install -m 0644 "$SETUP_DIR/systemd/soraccel-sync-time.service" \
   /etc/systemd/system/soraccel-sync-time.service
+chmod 0755 "$SETUP_DIR/scripts/sync-time-https"
 systemctl daemon-reload
 systemctl enable soraccel-sync-time.service
 install -d -o "$service_user" -g "$service_group" -m 0755 "$user_systemd_dir/default.target.wants"
