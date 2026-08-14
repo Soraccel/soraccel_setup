@@ -46,6 +46,67 @@ def env(value, name):
     return result
 
 
+def string_list(value, name):
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(isinstance(item, str) and item for item in value):
+        fail(f"{name} must be a list of non-empty strings")
+    return value
+
+
+def bool_value(value, name):
+    if not isinstance(value, bool):
+        fail(f"{name} must be true or false")
+    return value
+
+
+def runtime_options(value, name):
+    runtime = mapping(value, name)
+    supported = {
+        "privileged",
+        "read_only",
+        "volumes",
+        "devices",
+        "device_cgroup_rules",
+        "cap_add",
+        "group_add",
+        "security_opt",
+        "tmpfs",
+    }
+    unknown = set(runtime).difference(supported)
+    if unknown:
+        fail(f"{name} has unsupported keys: {', '.join(sorted(unknown))}")
+    result = {}
+    for key in ("privileged", "read_only"):
+        if key in runtime:
+            result[key] = bool_value(runtime[key], f"{name}.{key}")
+    for key in ("volumes", "devices", "device_cgroup_rules", "cap_add", "group_add", "security_opt", "tmpfs"):
+        if key in runtime:
+            result[key] = string_list(runtime[key], f"{name}.{key}")
+    return result
+
+
+def merge_runtime(service, runtime, *, replace_security=False):
+    for key in ("privileged", "read_only"):
+        if key in runtime:
+            service[key] = runtime[key]
+    for key in ("volumes", "devices", "device_cgroup_rules", "cap_add", "group_add", "tmpfs"):
+        if key not in runtime:
+            continue
+        values = service.setdefault(key, [])
+        for item in runtime[key]:
+            if item not in values:
+                values.append(item)
+    if "security_opt" in runtime:
+        if replace_security:
+            service["security_opt"] = list(runtime["security_opt"])
+        else:
+            values = service.setdefault("security_opt", [])
+            for item in runtime["security_opt"]:
+                if item not in values:
+                    values.append(item)
+
+
 def components(manifest):
     result = mapping(manifest.get("components"), "components")
     if not result:
@@ -94,6 +155,8 @@ def main():
         if metadata.get("name") != component:
             fail(f"Embedded metadata does not describe component {component}")
         launches = mapping(metadata.get("launches"), f"{component}.launches")
+        metadata_runtime = runtime_options(metadata.get("runtime"), f"{component}.runtime")
+        manifest_runtime = runtime_options(value.get("runtime"), f"components.{component}.runtime")
         enabled = set(value["enabled_at_boot"])
         unknown = enabled.difference(launches)
         if unknown:
@@ -123,6 +186,10 @@ def main():
                 "labels": {"com.soraccel.component": component, "com.soraccel.launch": launch_name,
                            "com.soraccel.enabled-at-boot": str(launch_name in enabled).lower()},
             }
+            merge_runtime(services[service], metadata_runtime)
+            merge_runtime(services[service], manifest_runtime, replace_security=True)
+            if services[service].get("privileged") is True and services[service].get("security_opt") == ["no-new-privileges:true"]:
+                services[service].pop("security_opt")
     write(args.compose_output, yaml.safe_dump({"services": services}, sort_keys=False))
     write(args.env_output, "".join(f"{key}={shlex.quote(value)}\n" for key, value in global_env.items()))
     return 0
