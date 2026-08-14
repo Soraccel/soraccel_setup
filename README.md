@@ -54,6 +54,51 @@ Non-secret files from `robots/<robot-id>/config/` are mirrored into
 `apply` also reconciles `SORACCEL_ROBOT_ID` into interactive Bash shells and
 the host user-systemd environment.
 
+If the selected deployment manifest includes the `localization` component,
+`apply` also ensures that an Exwayz license token exists locally. On the first
+interactive run it prompts:
+
+```text
+Exwayz license token:
+```
+
+The token is stored outside Git in:
+
+```text
+~/.config/soraccel/secrets/exwayz.env
+```
+
+Then `apply` injects `EXWAYZ_LICENSE_KEY` into the rendered runtime environment
+used by the generated Docker Compose services. Subsequent boots do not prompt:
+`soraccel-reconcile.service` reuses the stored secret. If the secret is missing
+and `apply` runs non-interactively, it fails deliberately instead of starting
+`localization` without a license.
+
+If the manifest includes the `sensors` component, `apply` also checks the camera
+USB mapping in `robots/<robot-id>/config/sensors.yaml`. A stable mapping should
+use `/dev/v4l/by-path/...` for UVC cameras and `usb_port_id` for RealSense
+cameras. If the config still contains volatile `/dev/videoX` devices or missing
+RealSense ports, `apply` runs an interactive detector:
+
+```bash
+/opt/soraccel/setup/scripts/configure-sensors-usb --robot-id test_robot
+```
+
+The detector lists the connected UVC and Intel RealSense devices and asks which
+physical device should be assigned to each configured camera name
+(`rgb_front`, `rgb_rear`, `depth_front`, `depth_rear`, ...). It writes the
+result back to the deployment checkout, then `apply` mirrors it into
+`/etc/soraccel/config/sensors.yaml`. Subsequent boots do not prompt unless the
+config becomes incomplete again.
+
+To inspect the detected topology without writing:
+
+```bash
+/opt/soraccel/setup/scripts/configure-sensors-usb \
+  --robot-id test_robot \
+  --print-only
+```
+
 For an intentional rollout:
 
 ```bash
