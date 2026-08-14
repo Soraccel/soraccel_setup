@@ -4,6 +4,8 @@ set -Eeuo pipefail
 setup_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 robot_id=""
 pull_images=true
+needs_exwayz_license=false
+needs_sensors_usb=false
 
 usage() {
   echo "Usage: $0 [--robot-id <id>] [--no-pull]" >&2
@@ -56,7 +58,46 @@ state_dir="${XDG_DATA_HOME:-$HOME/.local/share}/soraccel/$robot_id"
 runtime_env="${XDG_CONFIG_HOME:-$HOME/.config}/soraccel/$robot_id/runtime.env"
 compose_file="$state_dir/compose.yml"
 metadata_dir="$(mktemp -d)"
+secret_dir="${XDG_CONFIG_HOME:-$HOME/.config}/soraccel/secrets"
+exwayz_secret_env="$secret_dir/exwayz.env"
 trap 'rm -rf "$metadata_dir"' EXIT
+
+read_exwayz_license() {
+  [[ -f "$exwayz_secret_env" ]] || return 1
+  local value
+  value="$(grep -E '^EXWAYZ_LICENSE_KEY=' "$exwayz_secret_env" | tail -n 1 | cut -d= -f2- || true)"
+  [[ -n "$value" ]] || return 1
+  [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || return 1
+  printf '%s' "$value"
+}
+
+ensure_exwayz_license() {
+  local token
+  if token="$(read_exwayz_license)"; then
+    return 0
+  fi
+  [[ -r /dev/tty ]] || {
+    echo "The deployment includes localization, but no Exwayz license token is stored." >&2
+    echo "Run apply interactively once so it can create $exwayz_secret_env." >&2
+    exit 77
+  }
+  read -r -s -p "Exwayz license token: " token </dev/tty
+  printf '\n' >/dev/tty
+  [[ -n "$token" ]] || { echo "An empty Exwayz license token is not valid." >&2; exit 64; }
+  [[ "$token" != *$'\n'* && "$token" != *$'\r'* ]] || {
+    echo "The Exwayz license token cannot contain line breaks." >&2
+    exit 64
+  }
+  mkdir -p "$secret_dir"
+  chmod 0700 "$secret_dir"
+  local previous_umask
+  previous_umask="$(umask)"
+  umask 077
+  printf 'EXWAYZ_LICENSE_KEY=%s\n' "$token" > "$exwayz_secret_env"
+  umask "$previous_umask"
+  unset token
+  chmod 0600 "$exwayz_secret_env"
+}
 
 [[ -f "$manifest" ]] || { echo "Missing deployment manifest: $manifest" >&2; exit 66; }
 [[ -d "$config_source" ]] || { echo "Missing versioned robot configuration: $config_source" >&2; exit 66; }
@@ -90,6 +131,12 @@ done
 
 while IFS=$'\t' read -r component image; do
   [[ -n "$component" && -n "$image" ]] || continue
+  if [[ "$component" == "localization" ]]; then
+    needs_exwayz_license=true
+  fi
+  if [[ "$component" == "sensors" ]]; then
+    needs_sensors_usb=true
+  fi
   if [[ "$pull_images" == true ]]; then
     docker pull "$image"
   fi
@@ -103,11 +150,36 @@ while IFS=$'\t' read -r component image; do
   docker rm "$container_id" >/dev/null
 done < <(python3 "$setup_dir/scripts/render-deployment.py" --manifest "$manifest" --list-images)
 
+if [[ "$needs_exwayz_license" == true ]]; then
+  ensure_exwayz_license
+fi
+
+if [[ "$needs_sensors_usb" == true ]]; then
+  sensors_config="$config_source/sensors.yaml"
+  [[ -f "$sensors_config" ]] || {
+    echo "The deployment includes sensors, but $sensors_config is missing." >&2
+    exit 66
+  }
+  "$setup_dir/scripts/configure-sensors-usb" \
+    --robot-id "$robot_id" \
+    --config "$sensors_config" \
+    --skip-if-configured
+  install -m 0644 "$sensors_config" "$config_target/sensors.yaml"
+fi
+
 python3 "$setup_dir/scripts/render-deployment.py" \
   --manifest "$manifest" \
   --metadata-dir "$metadata_dir" \
   --compose-output "$compose_file" \
   --env-output "$runtime_env"
+
+if [[ "$needs_exwayz_license" == true ]]; then
+  {
+    printf '\n'
+    printf 'EXWAYZ_LICENSE_KEY=%s\n' "$(read_exwayz_license)"
+  } >> "$runtime_env"
+  chmod 0600 "$runtime_env"
+fi
 
 docker compose -f "$compose_file" config --quiet
 [[ -d /etc/soraccel/config ]] || { echo "Missing /etc/soraccel/config." >&2; exit 66; }

@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+"""Detect camera USB topology and write the robot sensors.yaml mapping."""
+import argparse
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+import yaml
+
+
+VIDEO_DEVICE = re.compile(r"^/dev/video[0-9]+$")
+
+
+def run(command):
+    try:
+        return subprocess.run(
+            command,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).stdout
+    except FileNotFoundError:
+        return ""
+
+
+def read(path):
+    try:
+        return Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def udev_properties(device):
+    output = run(["udevadm", "info", "--query=property", "--name", device])
+    properties = {}
+    for line in output.splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            properties[key] = value
+    return properties
+
+
+def v4l_info(device):
+    output = run(["v4l2-ctl", "--device", device, "--info"])
+    result = {}
+    for line in output.splitlines():
+        text = line.strip()
+        if ":" in text:
+            key, value = text.split(":", 1)
+            result[key.strip().lower()] = value.strip()
+    return result
+
+
+def detect_uvc_cameras():
+    candidates = []
+    seen = set()
+    by_path = Path("/dev/v4l/by-path")
+    links = sorted(by_path.glob("*-video-index0")) if by_path.is_dir() else []
+    devices = [str(link) for link in links]
+    if not devices:
+        devices = sorted(str(path) for path in Path("/dev").glob("video*"))
+
+    for device in devices:
+        real = os.path.realpath(device)
+        if real in seen:
+            continue
+        seen.add(real)
+        props = udev_properties(device)
+        info = v4l_info(device)
+        vendor = props.get("ID_VENDOR_ID", "").lower()
+        card = info.get("card type", props.get("ID_MODEL", "unknown"))
+        if vendor == "8086" or "realsense" in card.lower():
+            continue
+        capabilities = props.get("ID_V4L_CAPABILITIES", "")
+        if capabilities and ":capture:" not in capabilities:
+            continue
+        candidates.append(
+            {
+                "device": device,
+                "real": real,
+                "card": card,
+                "bus": info.get("bus info", props.get("ID_PATH", "")),
+                "serial": props.get("ID_SERIAL_SHORT", props.get("ID_SERIAL", "")),
+            }
+        )
+    return candidates
+
+
+def detect_realsense_cameras():
+    candidates = []
+    for device in sorted(Path("/sys/bus/usb/devices").glob("*")):
+        vendor = read(device / "idVendor").lower()
+        if vendor != "8086":
+            continue
+        product = read(device / "product") or "Intel RealSense"
+        serial = read(device / "serial")
+        candidates.append(
+            {
+                "usb_port_id": device.name,
+                "product": product,
+                "serial": serial,
+            }
+        )
+    return candidates
+
+
+def load_yaml(path):
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError) as error:
+        raise SystemExit(f"Cannot read {path}: {error}") from error
+    if not isinstance(data, dict):
+        raise SystemExit(f"{path} must contain a YAML mapping")
+    return data
+
+
+def sensors_params(data):
+    return data.setdefault("sensors", {}).setdefault("ros__parameters", {})
+
+
+def enabled(items):
+    return [item for item in items if item.get("enabled", True) is not False]
+
+
+def needs_configuration(data):
+    params = sensors_params(data)
+    for camera in enabled(params.get("usb_cameras", {}).get("cameras", [])):
+        if not camera.get("device") or VIDEO_DEVICE.fullmatch(str(camera.get("device"))):
+            return True
+    for camera in enabled(params.get("realsense_cameras", {}).get("cameras", [])):
+        if not camera.get("usb_port_id"):
+            return True
+    return False
+
+
+def print_detected(uvc, realsense):
+    print("Detected UVC/V4L2 cameras:")
+    if not uvc:
+        print("  none")
+    for index, camera in enumerate(uvc, 1):
+        serial = f", serial={camera['serial']}" if camera["serial"] else ""
+        print(
+            f"  {index}. {camera['device']} -> {camera['real']} "
+            f"({camera['card']}, bus={camera['bus']}{serial})"
+        )
+    print()
+    print("Detected Intel RealSense USB devices:")
+    if not realsense:
+        print("  none")
+    for index, camera in enumerate(realsense, 1):
+        serial = f", serial={camera['serial']}" if camera["serial"] else ""
+        print(f"  {index}. usb_port_id={camera['usb_port_id']} ({camera['product']}{serial})")
+
+
+def choose(label, current, candidates, value_key, display_key):
+    print()
+    print(f"{label}")
+    print(f"  current: {current or '<unset>'}")
+    for index, candidate in enumerate(candidates, 1):
+        print(f"  {index}. {candidate[display_key]}")
+    while True:
+        answer = input("  select number, Enter to keep current, or 's' to skip: ").strip()
+        if not answer:
+            return current
+        if answer.lower() == "s":
+            return current
+        if answer.isdigit():
+            index = int(answer)
+            if 1 <= index <= len(candidates):
+                return candidates[index - 1][value_key]
+        print("  invalid choice")
+
+
+def configure(data, uvc, realsense):
+    params = sensors_params(data)
+    usb_cameras = params.get("usb_cameras", {}).get("cameras", [])
+    for camera in enabled(usb_cameras):
+        camera["device"] = choose(
+            f"UVC camera '{camera.get('name', '<unnamed>')}'",
+            camera.get("device", ""),
+            uvc,
+            "device",
+            "device",
+        )
+
+    realsense_cameras = params.get("realsense_cameras", {}).get("cameras", [])
+    for camera in enabled(realsense_cameras):
+        camera["usb_port_id"] = choose(
+            f"RealSense camera '{camera.get('name', '<unnamed>')}'",
+            camera.get("usb_port_id", ""),
+            realsense,
+            "usb_port_id",
+            "usb_port_id",
+        )
+
+
+def default_config_path(robot_id):
+    deployment_dir = Path(os.environ.get("DEPLOYMENT_DIR", "/opt/soraccel/deployment"))
+    return deployment_dir / "robots" / robot_id / "config" / "sensors.yaml"
+
+
+def robot_id_from_env():
+    robot_env = Path("/etc/soraccel/robot.env")
+    if robot_env.is_file():
+        for line in robot_env.read_text(encoding="utf-8").splitlines():
+            if line.startswith("ROBOT_ID="):
+                return line.split("=", 1)[1]
+    return os.environ.get("SORACCEL_ROBOT_ID") or os.environ.get("ROBOT_ID") or ""
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--robot-id", default="")
+    parser.add_argument("--config", type=Path)
+    parser.add_argument("--print-only", action="store_true")
+    parser.add_argument("--skip-if-configured", action="store_true")
+    args = parser.parse_args()
+
+    robot_id = args.robot_id or robot_id_from_env()
+    config_path = args.config or default_config_path(robot_id)
+    if not config_path.is_file():
+        raise SystemExit(f"Missing sensors config: {config_path}")
+
+    data = load_yaml(config_path)
+    uvc = detect_uvc_cameras()
+    realsense = detect_realsense_cameras()
+
+    if args.print_only:
+        print_detected(uvc, realsense)
+        return 0
+
+    if args.skip_if_configured and not needs_configuration(data):
+        return 0
+
+    print_detected(uvc, realsense)
+    if not sys.stdin.isatty():
+        print(
+            "Sensors USB mapping is not fully configured and no interactive terminal is available.",
+            file=sys.stderr,
+        )
+        print(f"Run interactively: {Path(sys.argv[0]).name} --config {config_path}", file=sys.stderr)
+        return 77
+
+    configure(data, uvc, realsense)
+    config_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    print()
+    print(f"Updated {config_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
