@@ -26,8 +26,10 @@ if [[ $EUID -eq 0 ]]; then
 fi
 
 if [[ -r /etc/soraccel/robot.env ]]; then
+  set -a
   # shellcheck disable=SC1091
   source /etc/soraccel/robot.env
+  set +a
   [[ -n "$robot_id" ]] || robot_id="${ROBOT_ID:-}"
 fi
 [[ "$robot_id" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]] || {
@@ -122,11 +124,36 @@ for config_file in "${config_files[@]}"; do
   }
 done
 
+render_config_file() {
+  local source="$1" target="$2" tmp
+  tmp="$(mktemp)"
+  python3 - "$source" "$tmp" <<'PY'
+import os
+import re
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1])
+target = Path(sys.argv[2])
+rendered = os.path.expandvars(source.read_text(encoding="utf-8"))
+unresolved = re.search(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", rendered)
+if unresolved:
+    print(
+        f"{source} references unset environment variable {unresolved.group(1)!r}",
+        file=sys.stderr,
+    )
+    sys.exit(65)
+target.write_text(rendered, encoding="utf-8")
+PY
+  install -m 0644 "$tmp" "$target"
+  rm -f "$tmp"
+}
+
 # This target is exclusively managed by apply. Deleting stale files ensures a
 # removed configuration cannot silently affect an updated deployment.
 find "$config_target" -mindepth 1 -delete
 for config_file in "${config_files[@]}"; do
-  install -m 0644 "$config_source/$config_file" "$config_target/$config_file"
+  render_config_file "$config_source/$config_file" "$config_target/$config_file"
 done
 
 while IFS=$'\t' read -r component image; do
@@ -164,7 +191,7 @@ if [[ "$needs_sensors_usb" == true ]]; then
     --robot-id "$robot_id" \
     --config "$sensors_config" \
     --skip-if-configured
-  install -m 0644 "$sensors_config" "$config_target/sensors.yaml"
+  render_config_file "$sensors_config" "$config_target/sensors.yaml"
 fi
 
 python3 "$setup_dir/scripts/render-deployment.py" \

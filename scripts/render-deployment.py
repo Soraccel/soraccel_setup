@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Validate a robot manifest and render Compose from image-embedded metadata."""
 import argparse
+import os
 import re
 import shlex
 import sys
@@ -10,6 +11,7 @@ import yaml
 
 NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 ENV = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+UNRESOLVED_ENV = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
 def fail(message):
@@ -39,9 +41,12 @@ def env(value, name):
     for key, item in mapping(value, name).items():
         if not isinstance(key, str) or not ENV.fullmatch(key) or item is None:
             fail(f"Invalid variable in {name}: {key!r}")
-        text = str(item)
+        text = os.path.expandvars(str(item))
         if "\n" in text or "\r" in text:
             fail(f"{name}.{key} cannot contain a line break")
+        unresolved = UNRESOLVED_ENV.search(text)
+        if unresolved:
+            fail(f"{name}.{key} references unset environment variable {unresolved.group(1)!r}")
         result[key] = text
     return result
 

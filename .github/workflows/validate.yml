@@ -13,5 +13,5 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - run: bash -n scripts/apply scripts/bootstrap-robot scripts/install-deployment-revision scripts/run-service
+      - run: bash -n scripts/apply scripts/bootstrap-robot scripts/configure-network scripts/install-deployment-revision scripts/run-service
       - run: python3 -m py_compile scripts/render-deployment.py
