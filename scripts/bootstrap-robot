@@ -16,6 +16,18 @@ setup_url="$DEFAULT_SETUP_URL"
 date_time=""
 ghcr_username="soraccel-robot"
 service_user="sora"
+configure_network="ask"
+network_non_interactive=false
+pc_interface=""
+pc_address=""
+pc_gateway=""
+unitree_interface=""
+unitree_address=""
+lidar_interface=""
+lidar_host_address=""
+lidar_sensor_address=""
+lidar_msop_port=""
+lidar_difop_port=""
 
 usage() {
   cat <<'EOF'
@@ -28,6 +40,26 @@ Options:
   --date-time <UTC time>  Set the initial UTC time (ISO 8601 or date(1) input).
   --ghcr-username <name> GitHub account owning the read:packages token.
   --service-user <name>  Existing local account that runs containers (default: sora).
+  --configure-network    Configure robot network interfaces during bootstrap.
+  --skip-network         Do not ask for network configuration.
+  --network-non-interactive
+                          Do not prompt in configure-network; require flags.
+  --pc-interface <if>    ROS/operator-facing interface.
+  --pc-address <cidr>    Optional static ROS/operator address.
+  --pc-gateway <ip>      Optional ROS/operator gateway.
+  --unitree-interface <if>
+                          Unitree/B2W interface.
+  --unitree-address <cidr>
+                          Unitree-side static address.
+  --lidar-interface <if> LiDAR interface (default: Unitree interface).
+  --lidar-host-address <cidr>
+                          Jetson address targeted by the LiDAR.
+  --lidar-sensor-address <ip>
+                          LiDAR sensor IP.
+  --lidar-msop-port <port>
+                          RoboSense MSOP port.
+  --lidar-difop-port <port>
+                          RoboSense DIFOP port.
   -h, --help              Show this help.
 
 Run this script as root. It asks for the GHCR token on /dev/tty, so it is safe
@@ -45,6 +77,19 @@ while [[ $# -gt 0 ]]; do
     --date-time) date_time="${2:?missing date time}"; shift 2 ;;
     --ghcr-username) ghcr_username="${2:?missing GHCR username}"; shift 2 ;;
     --service-user) service_user="${2:?missing service user}"; shift 2 ;;
+    --configure-network) configure_network=true; shift ;;
+    --skip-network) configure_network=false; shift ;;
+    --network-non-interactive) network_non_interactive=true; configure_network=true; shift ;;
+    --pc-interface) pc_interface="${2:?missing PC interface}"; configure_network=true; shift 2 ;;
+    --pc-address) pc_address="${2:?missing PC address}"; configure_network=true; shift 2 ;;
+    --pc-gateway) pc_gateway="${2:?missing PC gateway}"; configure_network=true; shift 2 ;;
+    --unitree-interface) unitree_interface="${2:?missing Unitree interface}"; configure_network=true; shift 2 ;;
+    --unitree-address) unitree_address="${2:?missing Unitree address}"; configure_network=true; shift 2 ;;
+    --lidar-interface) lidar_interface="${2:?missing LiDAR interface}"; configure_network=true; shift 2 ;;
+    --lidar-host-address) lidar_host_address="${2:?missing LiDAR host address}"; configure_network=true; shift 2 ;;
+    --lidar-sensor-address) lidar_sensor_address="${2:?missing LiDAR sensor address}"; configure_network=true; shift 2 ;;
+    --lidar-msop-port) lidar_msop_port="${2:?missing LiDAR MSOP port}"; configure_network=true; shift 2 ;;
+    --lidar-difop-port) lidar_difop_port="${2:?missing LiDAR DIFOP port}"; configure_network=true; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 64 ;;
   esac
@@ -158,6 +203,33 @@ install_revision() {
 echo "==> Installing approved setup and deployment revisions"
 install_revision "$SETUP_DIR" "$setup_url" "$setup_ref"
 install_revision "$DEPLOYMENT_DIR" "$deployment_url" "$deployment_ref"
+
+if [[ "$configure_network" == "ask" ]]; then
+  configure_network=false
+  if [[ -r /dev/tty ]]; then
+    read -r -p "Configure robot network interfaces now? [y/N]: " answer </dev/tty
+    case "${answer,,}" in
+      y|yes) configure_network=true ;;
+    esac
+  fi
+fi
+
+if [[ "$configure_network" == true ]]; then
+  network_args=()
+  [[ "$network_non_interactive" == false ]] || network_args+=(--non-interactive)
+  [[ -z "$pc_interface" ]] || network_args+=(--pc-interface "$pc_interface")
+  [[ -z "$pc_address" ]] || network_args+=(--pc-address "$pc_address")
+  [[ -z "$pc_gateway" ]] || network_args+=(--pc-gateway "$pc_gateway")
+  [[ -z "$unitree_interface" ]] || network_args+=(--unitree-interface "$unitree_interface")
+  [[ -z "$unitree_address" ]] || network_args+=(--unitree-address "$unitree_address")
+  [[ -z "$lidar_interface" ]] || network_args+=(--lidar-interface "$lidar_interface")
+  [[ -z "$lidar_host_address" ]] || network_args+=(--lidar-host-address "$lidar_host_address")
+  [[ -z "$lidar_sensor_address" ]] || network_args+=(--lidar-sensor-address "$lidar_sensor_address")
+  [[ -z "$lidar_msop_port" ]] || network_args+=(--lidar-msop-port "$lidar_msop_port")
+  [[ -z "$lidar_difop_port" ]] || network_args+=(--lidar-difop-port "$lidar_difop_port")
+  chmod 0755 "$SETUP_DIR/scripts/configure-network"
+  "$SETUP_DIR/scripts/configure-network" "${network_args[@]}"
+fi
 
 # User units provide the operational interface: one unit per Compose service.
 # Linger keeps them available at boot even before the operator logs in.

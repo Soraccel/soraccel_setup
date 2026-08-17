@@ -1,0 +1,280 @@
+#!/usr/bin/env bash
+# Configure persistent robot network addresses and write Soraccel network
+# variables to /etc/soraccel/robot.env.
+set -Eeuo pipefail
+
+readonly ROBOT_ENV="/etc/soraccel/robot.env"
+
+pc_interface=""
+pc_address=""
+pc_gateway=""
+unitree_interface=""
+unitree_address="192.168.123.51/24"
+lidar_interface=""
+lidar_host_address="192.168.1.102/24"
+lidar_sensor_address="192.168.1.20"
+lidar_msop_port="6699"
+lidar_difop_port="7788"
+non_interactive=false
+dry_run=false
+write_env_only=false
+
+usage() {
+  cat <<'EOF'
+Usage: configure-network [options]
+
+Configures robot network interfaces with NetworkManager and stores the selected
+values in /etc/soraccel/robot.env.
+
+Options:
+  --pc-interface <ifname>         ROS/operator-facing interface.
+  --pc-address <cidr>             Optional static PC-side address, e.g. 192.168.0.185/24.
+  --pc-gateway <ip>               Optional PC-side gateway, e.g. 192.168.0.1.
+  --unitree-interface <ifname>    Unitree/B2W interface.
+  --unitree-address <cidr>        Unitree-side Jetson address (default: 192.168.123.51/24).
+  --lidar-interface <ifname>      LiDAR interface (default: --unitree-interface).
+  --lidar-host-address <cidr>     Jetson address targeted by the LiDAR (default: 192.168.1.102/24).
+  --lidar-sensor-address <ip>     LiDAR sensor IP (default: 192.168.1.20).
+  --lidar-msop-port <port>        RoboSense MSOP port (default: 6699).
+  --lidar-difop-port <port>       RoboSense DIFOP port (default: 7788).
+  --non-interactive               Do not prompt; require needed values via flags.
+  --write-env-only                Only write /etc/soraccel/robot.env, do not run nmcli.
+  --dry-run                       Print planned actions without modifying the host.
+  -h, --help                      Show this help.
+
+Run as root.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --pc-interface) pc_interface="${2:?missing PC interface}"; shift 2 ;;
+    --pc-address) pc_address="${2:?missing PC address}"; shift 2 ;;
+    --pc-gateway) pc_gateway="${2:?missing PC gateway}"; shift 2 ;;
+    --unitree-interface) unitree_interface="${2:?missing Unitree interface}"; shift 2 ;;
+    --unitree-address) unitree_address="${2:?missing Unitree address}"; shift 2 ;;
+    --lidar-interface) lidar_interface="${2:?missing LiDAR interface}"; shift 2 ;;
+    --lidar-host-address) lidar_host_address="${2:?missing LiDAR host address}"; shift 2 ;;
+    --lidar-sensor-address) lidar_sensor_address="${2:?missing LiDAR sensor address}"; shift 2 ;;
+    --lidar-msop-port) lidar_msop_port="${2:?missing LiDAR MSOP port}"; shift 2 ;;
+    --lidar-difop-port) lidar_difop_port="${2:?missing LiDAR DIFOP port}"; shift 2 ;;
+    --non-interactive) non_interactive=true; shift ;;
+    --write-env-only) write_env_only=true; shift ;;
+    --dry-run) dry_run=true; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown option: $1" >&2; usage >&2; exit 64 ;;
+  esac
+done
+
+[[ $EUID -eq 0 ]] || { echo "Run with sudo." >&2; exit 77; }
+
+if [[ "$write_env_only" != true && "$dry_run" != true ]]; then
+  command -v nmcli >/dev/null 2>&1 || {
+    echo "NetworkManager CLI (nmcli) is required." >&2
+    exit 69
+  }
+fi
+
+prompt() {
+  local label="$1" default_value="${2:-}" value
+  [[ "$non_interactive" == false && -r /dev/tty ]] || {
+    printf '%s' "$default_value"
+    return 0
+  }
+  if [[ -n "$default_value" ]]; then
+    read -r -p "$label [$default_value]: " value </dev/tty
+    printf '%s' "${value:-$default_value}"
+  else
+    read -r -p "$label: " value </dev/tty
+    printf '%s' "$value"
+  fi
+}
+
+list_interfaces() {
+  ip -br link show | awk '$1 != "lo" {print "  " $1}'
+}
+
+default_route_interface() {
+  ip route show default 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}'
+}
+
+validate_interface() {
+  local value="$1" label="$2"
+  [[ "$value" =~ ^[A-Za-z0-9_.:-]+$ ]] || {
+    echo "$label is not a valid interface name: $value" >&2
+    exit 64
+  }
+  ip link show dev "$value" >/dev/null 2>&1 || {
+    echo "$label does not exist on this host: $value" >&2
+    exit 66
+  }
+}
+
+validate_cidr() {
+  local value="$1" label="$2"
+  [[ "$value" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]] || {
+    echo "$label must be an IPv4 CIDR, e.g. 192.168.1.102/24: $value" >&2
+    exit 64
+  }
+}
+
+validate_ip() {
+  local value="$1" label="$2"
+  [[ "$value" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || {
+    echo "$label must be an IPv4 address: $value" >&2
+    exit 64
+  }
+}
+
+validate_port() {
+  local value="$1" label="$2"
+  [[ "$value" =~ ^[0-9]+$ && "$value" -ge 1 && "$value" -le 65535 ]] || {
+    echo "$label must be a TCP/UDP port number: $value" >&2
+    exit 64
+  }
+}
+
+echo "==> Available network interfaces"
+list_interfaces
+
+pc_interface="${pc_interface:-$(prompt "ROS/operator interface" "$(default_route_interface)")}"
+unitree_interface="${unitree_interface:-$(prompt "Unitree/B2W interface" "")}"
+lidar_interface="${lidar_interface:-$unitree_interface}"
+
+[[ -n "$pc_interface" ]] || { echo "A ROS/operator interface is required." >&2; exit 64; }
+[[ -n "$unitree_interface" ]] || { echo "A Unitree/B2W interface is required." >&2; exit 64; }
+[[ -n "$lidar_interface" ]] || { echo "A LiDAR interface is required." >&2; exit 64; }
+
+if [[ "$non_interactive" == false && -r /dev/tty ]]; then
+  pc_address="${pc_address:-$(prompt "Optional static address for $pc_interface; leave empty to keep current config" "")}"
+  pc_gateway="${pc_gateway:-$(prompt "Optional gateway for $pc_interface; leave empty for none" "")}"
+  unitree_address="${unitree_address:-$(prompt "Static Unitree address on $unitree_interface" "$unitree_address")}"
+  lidar_host_address="${lidar_host_address:-$(prompt "Static LiDAR host address on $lidar_interface" "$lidar_host_address")}"
+  lidar_sensor_address="${lidar_sensor_address:-$(prompt "LiDAR sensor IP" "$lidar_sensor_address")}"
+  lidar_msop_port="${lidar_msop_port:-$(prompt "LiDAR MSOP port" "$lidar_msop_port")}"
+  lidar_difop_port="${lidar_difop_port:-$(prompt "LiDAR DIFOP port" "$lidar_difop_port")}"
+fi
+
+validate_interface "$pc_interface" "ROS/operator interface"
+validate_interface "$unitree_interface" "Unitree/B2W interface"
+validate_interface "$lidar_interface" "LiDAR interface"
+[[ -z "$pc_address" ]] || validate_cidr "$pc_address" "PC-side static address"
+[[ -z "$pc_gateway" ]] || validate_ip "$pc_gateway" "PC-side gateway"
+validate_cidr "$unitree_address" "Unitree-side static address"
+validate_cidr "$lidar_host_address" "LiDAR host static address"
+validate_ip "$lidar_sensor_address" "LiDAR sensor address"
+validate_port "$lidar_msop_port" "LiDAR MSOP port"
+validate_port "$lidar_difop_port" "LiDAR DIFOP port"
+
+connection_for_interface() {
+  local interface="$1" connection
+  connection="$(nmcli -g GENERAL.CONNECTION device show "$interface" 2>/dev/null | head -n 1 || true)"
+  if [[ -z "$connection" || "$connection" == "--" ]]; then
+    connection="soraccel-${interface}"
+    nmcli connection add type ethernet ifname "$interface" con-name "$connection" >/dev/null
+  fi
+  printf '%s' "$connection"
+}
+
+configure_static_interface() {
+  local interface="$1" addresses_csv="$2" gateway="$3" never_default="$4"
+  local connection
+
+  if [[ "$dry_run" == true ]]; then
+    echo "==> Would configure $interface via NetworkManager"
+    echo "    addresses: $addresses_csv"
+    if [[ -n "$gateway" ]]; then
+      echo "    gateway: $gateway"
+    fi
+    echo "    never-default: $never_default"
+    return 0
+  fi
+
+  connection="$(connection_for_interface "$interface")"
+  echo "==> Configuring $interface via NetworkManager connection '$connection'"
+  echo "    addresses: $addresses_csv"
+  if [[ -n "$gateway" ]]; then
+    echo "    gateway: $gateway"
+  fi
+
+  nmcli connection modify "$connection" \
+    ipv4.method manual \
+    ipv4.addresses "$addresses_csv" \
+    ipv4.never-default "$never_default" \
+    ipv6.method ignore
+  if [[ -n "$gateway" ]]; then
+    nmcli connection modify "$connection" ipv4.gateway "$gateway"
+  else
+    nmcli connection modify "$connection" ipv4.gateway ""
+  fi
+  nmcli connection up "$connection" >/dev/null
+}
+
+if [[ "$write_env_only" != true ]]; then
+  if [[ -n "$pc_address" ]]; then
+    configure_static_interface "$pc_interface" "$pc_address" "$pc_gateway" "$([[ -n "$pc_gateway" ]] && echo no || echo yes)"
+  else
+    echo "==> Keeping current IP configuration for $pc_interface"
+  fi
+
+  if [[ "$unitree_interface" == "$lidar_interface" ]]; then
+    configure_static_interface "$unitree_interface" "${unitree_address},${lidar_host_address}" "" yes
+  else
+    configure_static_interface "$unitree_interface" "$unitree_address" "" yes
+    configure_static_interface "$lidar_interface" "$lidar_host_address" "" yes
+  fi
+fi
+
+lidar_host_ip="${lidar_host_address%%/*}"
+
+write_robot_env() {
+  local tmp group
+  install -d -m 0750 /etc/soraccel
+  tmp="$(mktemp)"
+  if [[ -f "$ROBOT_ENV" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      case "$line" in
+        SORACCEL_PC_INTERFACE=*|SORACCEL_PC_ADDRESS=*|SORACCEL_PC_GATEWAY=*|\
+        SORACCEL_UNITREE_INTERFACE=*|SORACCEL_UNITREE_ADDRESS=*|\
+        SORACCEL_LIDAR_INTERFACE=*|SORACCEL_LIDAR_HOST_ADDRESS=*|\
+        SORACCEL_LIDAR_HOST_IP=*|SORACCEL_LIDAR_SENSOR_ADDRESS=*|\
+        SORACCEL_LIDAR_MSOP_PORT=*|SORACCEL_LIDAR_DIFOP_PORT=*)
+          ;;
+        *) printf '%s\n' "$line" >> "$tmp" ;;
+      esac
+    done < "$ROBOT_ENV"
+  fi
+
+  {
+    printf 'SORACCEL_PC_INTERFACE=%s\n' "$pc_interface"
+    [[ -z "$pc_address" ]] || printf 'SORACCEL_PC_ADDRESS=%s\n' "$pc_address"
+    [[ -z "$pc_gateway" ]] || printf 'SORACCEL_PC_GATEWAY=%s\n' "$pc_gateway"
+    printf 'SORACCEL_UNITREE_INTERFACE=%s\n' "$unitree_interface"
+    printf 'SORACCEL_UNITREE_ADDRESS=%s\n' "$unitree_address"
+    printf 'SORACCEL_LIDAR_INTERFACE=%s\n' "$lidar_interface"
+    printf 'SORACCEL_LIDAR_HOST_ADDRESS=%s\n' "$lidar_host_address"
+    printf 'SORACCEL_LIDAR_HOST_IP=%s\n' "$lidar_host_ip"
+    printf 'SORACCEL_LIDAR_SENSOR_ADDRESS=%s\n' "$lidar_sensor_address"
+    printf 'SORACCEL_LIDAR_MSOP_PORT=%s\n' "$lidar_msop_port"
+    printf 'SORACCEL_LIDAR_DIFOP_PORT=%s\n' "$lidar_difop_port"
+  } >> "$tmp"
+
+  if [[ "$dry_run" == true ]]; then
+    echo "==> Would write $ROBOT_ENV:"
+    sed -n '1,220p' "$tmp"
+    rm -f "$tmp"
+    return 0
+  fi
+
+  group="$(stat -c %g "$ROBOT_ENV" 2>/dev/null || echo 0)"
+  install -o root -g "$group" -m 0640 "$tmp" "$ROBOT_ENV"
+  rm -f "$tmp"
+}
+
+write_robot_env
+
+echo "==> Network configuration complete"
+echo "ROS/operator interface : $pc_interface"
+echo "Unitree/B2W interface  : $unitree_interface ($unitree_address)"
+echo "LiDAR interface        : $lidar_interface ($lidar_host_address)"
+echo "LiDAR sensor           : $lidar_sensor_address:$lidar_msop_port/$lidar_difop_port"
